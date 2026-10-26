@@ -1,0 +1,611 @@
+import { Patient, FollowUpEntry } from '../types/pharmacy';
+
+export interface GasUrlValidationResult {
+  isValid: boolean;
+  normalizedUrl: string;
+  error?: string;
+  warning?: string;
+  tip?: string;
+}
+
+/**
+ * Validates the user-entered Google Apps Script Web App URL
+ */
+export function validateGasUrl(rawUrl: string): GasUrlValidationResult {
+  if (!rawUrl || !rawUrl.trim()) {
+    return {
+      isValid: false,
+      normalizedUrl: '',
+      error: 'الرابط فارغ. يرجى إدخال رابط Web App URL المنتهي بـ /exec',
+    };
+  }
+
+  let url = rawUrl.trim();
+
+  // Common user mistake: pasting Google Sheet URL directly
+  if (url.includes('docs.google.com/spreadsheets')) {
+    return {
+      isValid: false,
+      normalizedUrl: url,
+      error: 'الرابط المدخل هو رابط جدول Google Sheets نفسه وليس رابط تطبيق الويب (Web App)!',
+      tip: 'افتح الشيت > اضغط على الامتدادات (Extensions) > Apps Script > ثم في أعلى اليمين اضغط نشر (Deploy) > تطبيق ويب (Web app) > انسخ الرابط.',
+    };
+  }
+
+  // Common user mistake: pasting script editor URL
+  if (url.includes('script.google.com/d/') && url.includes('/edit')) {
+    return {
+      isValid: false,
+      normalizedUrl: url,
+      error: 'الرابط المدخل هو رابط محرر الأكواد (Script Editor) وليس رابط تطبيق الويب المنشور!',
+      tip: 'اضغط على زر نشر (Deploy) بالأعلى > New deployment > اختر Web app وانسخ الرابط المنتهي بـ /exec.',
+    };
+  }
+
+  // Common user mistake: using /dev test deployment URL
+  if (url.endsWith('/dev') || url.includes('/dev?')) {
+    const fixedUrl = url.replace(/\/dev(\b|\?|$)/, '/exec$1');
+    return {
+      isValid: false,
+      normalizedUrl: fixedUrl,
+      warning: 'الرابط ينتهي بـ /dev (وضع التطوير الذي يتطلب تسجيل الدخول ولا يعمل مع المواقع الخارجية).',
+      tip: 'يجب استخدام الرابط المنتهي بـ /exec. يمكنك الضغط على "إصلاح تلقائي" لتحويله إلى /exec.',
+    };
+  }
+
+  if (!url.startsWith('https://script.google.com/macros/s/')) {
+    return {
+      isValid: false,
+      normalizedUrl: url,
+      warning: 'الرابط لا يبدأ بالصيغة المعتادة لـ Google Apps Script (https://script.google.com/macros/s/...)',
+      tip: 'تأكد من أن الرابط منسوخ من نافذة النشر (New Deployment) كـ Web App.',
+    };
+  }
+
+  if (!url.includes('/exec')) {
+    return {
+      isValid: false,
+      normalizedUrl: url,
+      warning: 'رابط تطبيق الويب يجب أن ينتهي بـ /exec.',
+      tip: 'تأكد من اختيار Web App أثناء النشر.',
+    };
+  }
+
+  return {
+    isValid: true,
+    normalizedUrl: url,
+  };
+}
+
+export interface GasDiagnosticResult {
+  success: boolean;
+  message: string;
+  tip?: string;
+  statusCode?: number;
+  patientsCount?: number;
+  followUpsCount?: number;
+  spreadsheetName?: string;
+  version?: string;
+}
+
+/**
+ * Executes a call to Google Apps Script using high-speed server proxy first,
+ * with graceful browser fallbacks (JSONP/direct no-cors)
+ */
+async function callGasApi(
+  gasUrl: string,
+  options: {
+    method?: 'GET' | 'POST';
+    params?: Record<string, string>;
+    payload?: any;
+    timeoutMs?: number;
+  }
+): Promise<any> {
+  const method = options.method || 'POST';
+  const timeoutMs = options.timeoutMs || 10000;
+  const cleanUrl = gasUrl.trim();
+
+  // 1. Try server proxy route first (works in AI Studio backend & Netlify Functions)
+  try {
+    const proxyController = new AbortController();
+    const proxyTimeout = setTimeout(() => proxyController.abort(), timeoutMs);
+
+    const proxyRes = await fetch('/api/gas/proxy', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        gasUrl: cleanUrl,
+        method,
+        params: options.params,
+        payload: options.payload,
+      }),
+      signal: proxyController.signal,
+    });
+    clearTimeout(proxyTimeout);
+
+    if (proxyRes.ok) {
+      const data = await proxyRes.json();
+      if (data && (data.status === 'SUCCESS' || data.fileUrl || data.patients)) {
+        return data;
+      }
+    }
+  } catch (proxyErr) {
+    // If backend proxy is not accessible, fall back to direct browser methods
+  }
+
+  // 2. Direct browser methods
+  if (method === 'GET') {
+    return fetchFromGoogleSheetJSONP(cleanUrl, options.params);
+  } else {
+    const bodyStr = typeof options.payload === 'string' ? options.payload : JSON.stringify(options.payload || {});
+
+    // Try direct CORS fetch with text/plain (avoids preflight and reads 302 redirect response)
+    try {
+      const directController = new AbortController();
+      const directTimeout = setTimeout(() => directController.abort(), timeoutMs);
+
+      const directRes = await fetch(cleanUrl, {
+        method: 'POST',
+        headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+        body: bodyStr,
+        signal: directController.signal,
+      });
+      clearTimeout(directTimeout);
+
+      if (directRes.ok) {
+        const text = await directRes.text();
+        try {
+          const json = JSON.parse(text);
+          return json;
+        } catch {
+          return { status: 'SUCCESS', raw: text };
+        }
+      }
+    } catch (directErr) {
+      console.warn('Direct CORS POST threw exception, using no-cors channel...', directErr);
+    }
+
+    // Direct browser POST using no-cors fallback
+    await fetch(cleanUrl, {
+      method: 'POST',
+      mode: 'no-cors',
+      headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+      body: bodyStr,
+    });
+
+    return { status: 'SUCCESS', mode: 'no-cors' };
+  }
+}
+
+/**
+ * Runs a comprehensive diagnostic check against the Google Apps Script endpoint
+ */
+export async function testSheetConnectionDetailed(gasUrl: string): Promise<GasDiagnosticResult> {
+  const validation = validateGasUrl(gasUrl);
+  if (!validation.isValid && validation.error) {
+    return {
+      success: false,
+      message: validation.error,
+      tip: validation.tip,
+    };
+  }
+
+  const cleanUrl = validation.normalizedUrl;
+
+  try {
+    const json = await callGasApi(cleanUrl, {
+      method: 'GET',
+      params: { action: 'PING', _t: String(Date.now()) },
+      timeoutMs: 6000,
+    });
+
+    if (json && json.status === 'SUCCESS') {
+      return {
+        success: true,
+        message: 'تم الاتصال بالخادم السحابي بنجاح!',
+        patientsCount: json.counts?.patients,
+        followUpsCount: json.counts?.followUps,
+        spreadsheetName: json.spreadsheetName,
+        version: json.version,
+      };
+    }
+  } catch (err: any) {
+    console.warn('Proxy ping failed, falling back to JSONP test...', err);
+  }
+
+  // Fallback check via JSONP
+  try {
+    const jsonpData = await fetchFromGoogleSheetJSONP(cleanUrl, { action: 'PING' });
+    return {
+      success: true,
+      message: 'تم الاتصال بنجاح عبر قناة JSONP السريعة!',
+      patientsCount: jsonpData?.counts?.patients ?? (jsonpData.patients ? jsonpData.patients.length : 0),
+      followUpsCount: jsonpData?.counts?.followUps ?? (jsonpData.followUps ? jsonpData.followUps.length : 0),
+      spreadsheetName: jsonpData?.spreadsheetName,
+    };
+  } catch (jsonpErr: any) {
+    console.error('Diagnostic test failed:', jsonpErr);
+    return {
+      success: false,
+      message: 'تعذر الاتصال بـ Google Apps Script.',
+      tip: 'تأكد من: 1) نشر السكريبت كـ Web App مع إتاحة الوصول لـ "Anyone". 2) تشغيل دالة testConnection داخل محرر Apps Script للتحقق من منح الصلاحيات (Authorize). 3) نسخ الرابط المنتهي بـ /exec.',
+    };
+  }
+}
+
+/**
+ * Uploads a pure full-resolution scan image to Google Drive folder (PharmPulse_Prescriptions_Labs)
+ */
+export async function uploadScanImageToDrive(
+  gasUrl: string,
+  patientId: string,
+  fileName: string,
+  base64Data: string
+): Promise<{
+  success: boolean;
+  fileUrl?: string;
+  previewUrl?: string;
+  thumbnailUrl?: string;
+  fileId?: string;
+  error?: string;
+}> {
+  if (!gasUrl) {
+    return { success: false, error: 'NO_GAS_URL' };
+  }
+
+  const cleanUrl = gasUrl.trim();
+  const payload = {
+    action: 'UPLOAD_SCAN',
+    patientId: patientId || 'Patient',
+    title: fileName || 'Prescription_Scan.jpg',
+    base64Data,
+    timestamp: new Date().toISOString(),
+  };
+
+  try {
+    const result = await callGasApi(cleanUrl, {
+      method: 'POST',
+      payload,
+      timeoutMs: 25000,
+    });
+    if (result && (result.status === 'SUCCESS' || result.fileUrl)) {
+      return {
+        success: true,
+        fileUrl: result.fileUrl,
+        previewUrl: result.previewUrl || result.fileUrl,
+        thumbnailUrl: result.thumbnailUrl || result.previewUrl || result.fileUrl,
+        fileId: result.fileId,
+      };
+    }
+    return { success: false, error: result?.message || 'Upload failed' };
+  } catch (err: any) {
+    console.warn('uploadScanImageToDrive error:', err);
+    return { success: false, error: err.message };
+  }
+}
+
+/**
+ * Requests browser storage persistence to prevent iOS/Safari/Netlify from evicting IndexedDB
+ */
+export async function requestPersistentStorage(): Promise<boolean> {
+  if (typeof window !== 'undefined' && 'storage' in navigator && navigator.storage?.persist) {
+    try {
+      const isPersisted = await navigator.storage.persist();
+      console.log('IndexedDB persistent storage granted:', isPersisted);
+      return isPersisted;
+    } catch (e) {
+      console.warn('Could not request persistent storage:', e);
+    }
+  }
+  return false;
+}
+
+/**
+ * Sanitizes patient scans before sending to Google Sheets so that huge base64 strings
+ * do not exceed the 50,000 character cell limit, while preserving drive and preview URLs.
+ */
+function sanitizePatientForSheet(patient: Patient): Patient {
+  if (!patient.scans || patient.scans.length === 0) return patient;
+  const cleanScans = patient.scans.map(s => {
+    const { dataUrl, ...rest } = s;
+    return rest;
+  });
+  return {
+    ...patient,
+    scans: cleanScans as any,
+  };
+}
+
+/**
+ * Saves a single patient immediately to Google Sheets (fast targeted update)
+ */
+export async function savePatientToGoogleSheet(
+  gasUrl: string,
+  patient: Patient
+): Promise<{ success: boolean; data?: any }> {
+  if (!gasUrl || !patient || !patient.id) return { success: false };
+
+  const cleanUrl = gasUrl.trim();
+  const payload = {
+    action: 'SAVE_PATIENT',
+    patient: sanitizePatientForSheet(patient),
+    timestamp: new Date().toISOString(),
+  };
+
+  try {
+    const result = await callGasApi(cleanUrl, {
+      method: 'POST',
+      payload,
+      timeoutMs: 9000,
+    });
+    return { success: true, data: result };
+  } catch (err: any) {
+    console.warn('savePatientToGoogleSheet error:', err);
+    return { success: false };
+  }
+}
+
+/**
+ * Saves a single clinical follow-up immediately to Google Sheets
+ */
+export async function saveFollowUpToGoogleSheet(
+  gasUrl: string,
+  followUp: FollowUpEntry
+): Promise<{ success: boolean; data?: any }> {
+  if (!gasUrl || !followUp || !followUp.id) return { success: false };
+
+  const cleanUrl = gasUrl.trim();
+  const payload = {
+    action: 'SAVE_FOLLOWUP',
+    followUp,
+    timestamp: new Date().toISOString(),
+  };
+
+  try {
+    const result = await callGasApi(cleanUrl, {
+      method: 'POST',
+      payload,
+      timeoutMs: 6000,
+    });
+    return { success: true, data: result };
+  } catch (err: any) {
+    console.warn('saveFollowUpToGoogleSheet error:', err);
+    return { success: false };
+  }
+}
+
+/**
+ * Push local database state upstream to Google Sheets.
+ * Supports chunked batch processing for 2,000+ patients to prevent 50MB payload crashes or execution timeouts.
+ */
+export async function syncPushToGoogleSheet(
+  gasUrl: string,
+  patients: Patient[],
+  followUps: FollowUpEntry[],
+  settings?: any,
+  onProgress?: (synced: number, total: number) => void
+) {
+  if (!gasUrl) return { success: false, reason: 'NO_GAS_URL' };
+
+  const cleanUrl = gasUrl.trim();
+  const sanitizedPatients = patients.map(sanitizePatientForSheet);
+
+  // If patient count is small (<= 200), single batch sync
+  if (sanitizedPatients.length <= 200) {
+    const payload = {
+      action: 'SYNC_UPSTREAM',
+      patients: sanitizedPatients,
+      followUps,
+      settings,
+      timestamp: new Date().toISOString(),
+    };
+
+    try {
+      const result = await callGasApi(cleanUrl, {
+        method: 'POST',
+        payload,
+        timeoutMs: 15000,
+      });
+      if (onProgress) onProgress(sanitizedPatients.length, sanitizedPatients.length);
+      return { success: true, data: result };
+    } catch (err: any) {
+      console.warn('syncPushToGoogleSheet single batch error:', err);
+      return { success: false };
+    }
+  }
+
+  // Chunked batching for 2,000+ records (150 patients per chunk)
+  const CHUNK_SIZE = 150;
+  const totalChunks = Math.ceil(sanitizedPatients.length / CHUNK_SIZE);
+
+  try {
+    for (let i = 0; i < totalChunks; i++) {
+      const start = i * CHUNK_SIZE;
+      const chunk = sanitizedPatients.slice(start, start + CHUNK_SIZE);
+      const isFirstChunk = i === 0;
+      const isLastChunk = i === totalChunks - 1;
+
+      const payload = {
+        action: 'SYNC_BATCH',
+        batchIndex: i,
+        totalBatches: totalChunks,
+        isFirstBatch: isFirstChunk,
+        isLastBatch: isLastChunk,
+        patients: chunk,
+        followUps: isFirstChunk ? followUps : [],
+        settings: isFirstChunk ? settings : undefined,
+        timestamp: new Date().toISOString(),
+      };
+
+      await callGasApi(cleanUrl, {
+        method: 'POST',
+        payload,
+        timeoutMs: 20000,
+      });
+
+      if (onProgress) {
+        onProgress(Math.min(start + CHUNK_SIZE, sanitizedPatients.length), sanitizedPatients.length);
+      }
+    }
+
+    return { success: true };
+  } catch (err: any) {
+    console.warn('syncPushToGoogleSheet chunked error:', err);
+    return { success: false, error: err.message };
+  }
+}
+
+/**
+ * Permanently delete a patient and their follow-ups from Google Sheet
+ */
+export async function deletePatientFromGoogleSheet(gasUrl: string, patientId: string): Promise<boolean> {
+  if (!gasUrl || !patientId) return false;
+  const cleanUrl = gasUrl.trim();
+  const payload = {
+    action: 'DELETE_PATIENT',
+    patientId,
+    timestamp: new Date().toISOString(),
+  };
+
+  try {
+    await callGasApi(cleanUrl, {
+      method: 'POST',
+      payload,
+      timeoutMs: 6000,
+    });
+    return true;
+  } catch (err) {
+    console.warn('deletePatientFromGoogleSheet error:', err);
+    return false;
+  }
+}
+
+/**
+ * Completely clears all patient and follow-up rows from Google Sheet
+ */
+export async function clearGoogleSheetDatabase(
+  gasUrl: string,
+  knownPatientIds: string[] = []
+): Promise<{ success: boolean; message?: string }> {
+  if (!gasUrl) return { success: false, message: 'NO_GAS_URL' };
+  const cleanUrl = gasUrl.trim();
+
+  let discoveredIds: string[] = [];
+  try {
+    const upstream = await fetchFromGoogleSheet(cleanUrl);
+    if (upstream && Array.isArray(upstream.patients)) {
+      discoveredIds = upstream.patients.map(p => p.id).filter(Boolean);
+    }
+  } catch (e) {}
+
+  const DEMO_IDS = ['PT-104821', 'PT-104822', 'PT-104823', 'PT-104824', 'PT-106550'];
+  const allIds = Array.from(new Set([...knownPatientIds, ...discoveredIds, ...DEMO_IDS]));
+
+  try {
+    await callGasApi(cleanUrl, {
+      method: 'POST',
+      payload: {
+        action: 'CLEAR_DATABASE',
+        timestamp: new Date().toISOString(),
+      },
+      timeoutMs: 8000,
+    });
+  } catch (e) {}
+
+  for (const id of allIds) {
+    if (id) {
+      try {
+        await deletePatientFromGoogleSheet(cleanUrl, id);
+      } catch (e) {}
+    }
+  }
+
+  return { success: true };
+}
+
+/**
+ * Fetch database records from Google Sheet with high-speed proxy and instant JSONP
+ */
+export async function fetchFromGoogleSheet(
+  gasUrl: string
+): Promise<{ patients?: Patient[]; followUps?: FollowUpEntry[]; settings?: any }> {
+  if (!gasUrl) throw new Error('NO_GAS_URL');
+  const cleanUrl = gasUrl.trim();
+
+  // Tier 1: Try high-speed server proxy if running
+  try {
+    const data = await callGasApi(cleanUrl, {
+      method: 'GET',
+      params: { action: 'FETCH_ALL', _t: String(Date.now()) },
+      timeoutMs: 5000,
+    });
+
+    if (data && data.status === 'SUCCESS' && Array.isArray(data.patients)) {
+      return {
+        patients: data.patients,
+        followUps: data.followUps || [],
+        settings: data.settings || null,
+      };
+    }
+  } catch (proxyErr) {}
+
+  // Tier 2: Instant JSONP client (works statically on Netlify, GitHub Pages, etc.)
+  return fetchFromGoogleSheetJSONP(cleanUrl, { action: 'FETCH_ALL' });
+}
+
+/**
+ * Standard high-speed JSONP client implementation for Google Apps Script
+ */
+export function fetchFromGoogleSheetJSONP(
+  gasUrl: string,
+  extraParams?: Record<string, string>
+): Promise<any> {
+  return new Promise((resolve, reject) => {
+    if (!gasUrl) {
+      return reject(new Error('NO_GAS_URL'));
+    }
+
+    const cleanUrl = gasUrl.trim();
+    const callbackName = 'jsonp_sync_' + Math.floor(Math.random() * 10000000);
+    const delimiter = cleanUrl.includes('?') ? '&' : '?';
+
+    const params = new URLSearchParams({
+      action: 'FETCH_ALL',
+      callback: callbackName,
+      _cacheBust: String(Date.now()),
+      ...(extraParams || {}),
+    });
+
+    const scriptUrl = `${cleanUrl}${delimiter}${params.toString()}`;
+
+    const timeout = setTimeout(() => {
+      cleanup();
+      reject(new Error('TIMEOUT'));
+    }, 6000);
+
+    function cleanup() {
+      clearTimeout(timeout);
+      delete (window as any)[callbackName];
+      const old = document.getElementById(callbackName);
+      if (old) old.remove();
+    }
+
+    (window as any)[callbackName] = function (res: any) {
+      cleanup();
+      if (res && res.status === 'SUCCESS') {
+        resolve(res);
+      } else {
+        reject(new Error('INVALID_DATA'));
+      }
+    };
+
+    const script = document.createElement('script');
+    script.id = callbackName;
+    script.src = scriptUrl;
+    script.onerror = function () {
+      cleanup();
+      reject(new Error('SCRIPT_LOAD_ERROR'));
+    };
+    document.body.appendChild(script);
+  });
+}
